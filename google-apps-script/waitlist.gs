@@ -4,6 +4,12 @@ const SPREADSHEET_ID = "1i2_lUmRSIVA1iN3zaE8mLrR-8QEpOUPKtM8Y6aHfw1w";
 const SHEET_NAME = "Waitlist";
 const EVENT_SHEET_NAME = "Events";
 
+// Bumped whenever this file changes in a way the site depends on, and returned
+// by doGet. Saving code in the Apps Script editor does not update the live web
+// app (that needs Deploy -> Manage deployments -> New version), and until now
+// there was no way to tell the deployed version apart from the committed one.
+const CODE_VERSION = "2026-09-09-ab-variant-2";
+
 // Separate product lines (gracecompanion, gracephone) share this one endpoint
 // and spreadsheet but land in their own tabs, so their signups/events never mix
 // with Grand's. Payloads carry a `product` field; anything without a known
@@ -79,6 +85,9 @@ const HEADERS = [
   // migrate without shifting any columns.
   "phone_type",
   "has_pets",
+  // Which homepage waitlist field this person was shown: "phone" or "email".
+  // Appended last so existing sheets migrate without shifting any columns.
+  "waitlist_variant",
 ];
 
 const EVENT_HEADERS = [
@@ -105,21 +114,42 @@ const EVENT_HEADERS = [
   "has_value",
   "looks_valid",
   "value_length_bucket",
+  "waitlist_variant",
 ];
 
 function doGet() {
   const spreadsheet = getSpreadsheet_();
-  const waitlistSheet = getSheet_(spreadsheet, SHEET_NAME);
-  const eventSheet = getSheet_(spreadsheet, EVENT_SHEET_NAME);
+
+  // Report every product's tabs, not just the default pair. The default
+  // SHEET_NAME/EVENT_SHEET_NAME tabs are the frozen email-era archive, so a
+  // health check that reported only those could not tell you whether live Grand
+  // signups (which route to the grandphone tabs) were landing at all — it just
+  // showed a stagnant row count. Uses getSheetByName rather than getSheet_ so a
+  // health check can never create an empty tab as a side effect.
+  const products = Object.assign(
+    { default: { waitlist: SHEET_NAME, events: EVENT_SHEET_NAME } },
+    PRODUCT_SHEETS,
+  );
+  const sheets = {};
+
+  Object.keys(products).forEach((product) => {
+    const waitlistSheet = spreadsheet.getSheetByName(products[product].waitlist);
+    const eventSheet = spreadsheet.getSheetByName(products[product].events);
+
+    sheets[product] = {
+      waitlist_sheet_name: products[product].waitlist,
+      waitlist_last_row: waitlistSheet ? waitlistSheet.getLastRow() : null,
+      event_sheet_name: products[product].events,
+      event_last_row: eventSheet ? eventSheet.getLastRow() : null,
+    };
+  });
 
   return jsonResponse_({
     ok: true,
     service: "Grand website backend",
+    code_version: CODE_VERSION,
     spreadsheet_url: spreadsheet.getUrl(),
-    waitlist_sheet_name: waitlistSheet.getName(),
-    waitlist_last_row: waitlistSheet.getLastRow(),
-    event_sheet_name: eventSheet.getName(),
-    event_last_row: eventSheet.getLastRow(),
+    sheets,
   });
 }
 
@@ -196,10 +226,20 @@ function handleWaitlistProfile_(payload) {
   const candidateId = candidateId_(payload.candidate_id);
   if (candidateId) profileValues.candidate_id = candidateId;
 
-  // Optional email captured on the profile page (phone products identify by
-  // phone, so email is just extra contact data). Only write it when provided so
-  // an empty submission never clears an email already on the row.
+  // The optional second contact method captured on the profile page: the phone
+  // arm is offered an email here, the email arm a phone. Neither is required,
+  // so only write a value when one was actually given — an empty submission
+  // must never clear a value already on the row.
   if (email) profileValues.email = email;
+  // Apostrophe-prefixed via plainTextPhone_ because writeProfileColumns_ uses
+  // setValue, which applies user-entry parsing: a raw "+1 (555) 123-4567" would
+  // be read as a formula and land as #ERROR!. Previously phone was only ever
+  // written to the standalone fallback row, never to a matched one, so a phone
+  // given on the profile page would have been dropped.
+  if (phone) profileValues.phone = plainTextPhone_(phone);
+
+  const variant = variant_(payload.waitlist_variant);
+  if (variant) profileValues.waitlist_variant = variant;
 
   const spreadsheet = getSpreadsheet_();
   const sheet = getSheet_(spreadsheet, sheetNamesForProduct_(payload.product).waitlist);
@@ -214,27 +254,19 @@ function handleWaitlistProfile_(payload) {
     lock.releaseLock();
   }
 
-  // The email capture is submitted with sendBeacon/keepalive so visitors can
-  // leave the page immediately. If the profile form is submitted right away,
-  // give the signup append a short chance to land before appending a fallback
+  // The signup is submitted with sendBeacon/keepalive so visitors can leave the
+  // page immediately. If the profile form is submitted right away, give the
+  // signup append a short chance to land before appending a fallback
   // profile-only row.
-  // Match the signup row by phone for phone-based products, otherwise by email.
-  const rowIndex = phone
-    ? waitForSignupRow_(sheet, "phone", phone)
-    : email
-      ? waitForSignupRow_(sheet, "email", email)
-      : -1;
+  const identities = signupIdentities_(candidateId, variant, phone, email);
+  const rowIndex = waitForSignupRow_(sheet, identities);
 
   lock.waitLock(10000);
   try {
     ensureHeaders_(sheet, HEADERS);
     ensurePhoneColumnIsText_(sheet);
 
-    const latestRowIndex = phone
-      ? findRowByColumn_(sheet, "phone", phone)
-      : email
-        ? findRowByColumn_(sheet, "email", email)
-        : -1;
+    const latestRowIndex = findSignupRow_(sheet, identities);
     const targetRowIndex = latestRowIndex > 0 ? latestRowIndex : rowIndex;
 
     if (targetRowIndex > 0) {
@@ -310,7 +342,28 @@ function ensureHeaders_(sheet, headers) {
   // row in place so the live sheet auto-migrates without a manual step. Safe
   // because we only ever append columns to the end — no existing column moves,
   // so overwriting row 1 rewrites the same labels plus the new ones.
-  if (sheet.getLastColumn() < headers.length) {
+  //
+  // Make sure the grid is physically wide enough first. A sheet whose column
+  // count still matches the old HEADERS length has no cell to write the new
+  // label into, and getRange past the grid edge throws.
+  const maxColumns = sheet.getMaxColumns();
+  if (maxColumns < headers.length) {
+    sheet.insertColumnsAfter(maxColumns, headers.length - maxColumns);
+  }
+
+  // Compare the header row's actual contents rather than sheet.getLastColumn().
+  // getLastColumn() reports the last column holding content ANYWHERE in the
+  // sheet, not the width of the header row — so a single stray value out to the
+  // right of the data (a hand-added notes column, a paste that overshot) makes
+  // it >= headers.length and this migration is silently skipped. New values
+  // still get written into their column, but with a blank header above them,
+  // which looks exactly like "the column never appeared".
+  const currentHeaders = sheet.getRange(1, 1, 1, headers.length).getValues()[0];
+  const headersAreStale = headers.some(function isMismatched(header, index) {
+    return String(currentHeaders[index] || "").trim() !== header;
+  });
+
+  if (headersAreStale) {
     sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
   }
 }
@@ -334,6 +387,13 @@ function candidateId_(value) {
   )
     ? candidateId
     : "";
+}
+
+// Allowlist the A/B variant tag. It comes from the client and lands in a sheet
+// cell, so only the two known values are ever written through.
+function variant_(value) {
+  const variant = String(value || "").trim().toLowerCase();
+  return variant === "phone" || variant === "email" ? variant : "";
 }
 
 function plainTextPhone_(value) {
@@ -375,9 +435,52 @@ function findRowByColumn_(sheet, header, value) {
   return -1;
 }
 
-function waitForSignupRow_(sheet, header, value) {
+// Ordered [column, value] pairs to try when matching a profile submission back
+// to its signup row, most reliable first.
+function signupIdentities_(candidateId, variant, phone, email) {
+  const identities = [];
+  const seen = {};
+
+  function add(column, value) {
+    const key = `${column}:${normalizeIdentity_(column, value)}`;
+    if (!value || seen[key]) return;
+    seen[key] = true;
+    identities.push([column, value]);
+  }
+
+  // candidate_id first: a random UUID that both the signup and the profile
+  // payload carry verbatim, so it does not depend on which field the A/B
+  // variant happened to ask for.
+  add("candidate_id", candidateId);
+
+  // Then the column the signup row was actually created with. This is what the
+  // variant tag is for: in the email arm the signup wrote only an email, so
+  // matching on phone would always miss — the row's phone column is blank while
+  // this profile payload may well carry a phone, and the miss would append a
+  // duplicate row for every single email-arm profile submission.
+  if (variant === "email") add("email", email);
+  if (variant === "phone") add("phone", phone);
+
+  // Finally anything else we hold, so untagged submissions from older sessions
+  // keep matching exactly as they did before.
+  add("phone", phone);
+  add("email", email);
+
+  return identities;
+}
+
+function findSignupRow_(sheet, identities) {
+  for (let i = 0; i < identities.length; i++) {
+    const rowIndex = findRowByColumn_(sheet, identities[i][0], identities[i][1]);
+    if (rowIndex > 0) return rowIndex;
+  }
+
+  return -1;
+}
+
+function waitForSignupRow_(sheet, identities) {
   for (let attempt = 0; attempt < 4; attempt++) {
-    const rowIndex = findRowByColumn_(sheet, header, value);
+    const rowIndex = findSignupRow_(sheet, identities);
     if (rowIndex > 0) return rowIndex;
     Utilities.sleep(350);
   }
@@ -452,6 +555,7 @@ function rowForPayload_(email, payload) {
   while (row.length < HEADERS.length) row.push("");
   row[HEADERS.indexOf("phone")] = plainTextPhone_(payload.phone);
   row[HEADERS.indexOf("candidate_id")] = candidateId_(payload.candidate_id);
+  row[HEADERS.indexOf("waitlist_variant")] = variant_(payload.waitlist_variant);
   return row;
 }
 
@@ -482,6 +586,7 @@ function rowForEventPayload_(payload) {
     valueOrBlank_(payload.has_value),
     valueOrBlank_(payload.looks_valid),
     payload.value_length_bucket || "",
+    variant_(payload.waitlist_variant),
   ];
 }
 

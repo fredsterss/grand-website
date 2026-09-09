@@ -86,6 +86,11 @@ function trackAnalyticsEvent(eventType, details = {}) {
     referrer: document.referrer || "",
     viewport: getViewportPayload(),
     section_id: getCurrentSectionId(),
+    // Which arm of the homepage waitlist A/B test this session was assigned.
+    // Tagging the base payload means every event is comparable by variant,
+    // including section_view — so "saw the form" and "signed up" come from one
+    // pipeline with one join key (session_id) rather than two.
+    waitlist_variant: window.grandWaitlistVariant || "",
     ...details,
   };
   const body = JSON.stringify(payload);
@@ -338,12 +343,12 @@ function getValueLengthBucket(value) {
   return "24+";
 }
 
-function getPhoneFieldState(input) {
+function getWaitlistFieldState(input, isEmail) {
   const value = input.value.trim();
 
   return {
     has_value: value.length > 0,
-    looks_valid: isValidWaitlistPhone(input),
+    looks_valid: isEmail ? value.length > 0 && input.checkValidity() : isValidWaitlistPhone(input),
     value_length_bucket: getValueLengthBucket(value),
   };
 }
@@ -415,13 +420,18 @@ function firePixelConversion(metaEvent, redditEvent) {
   } catch {}
 }
 
-function buildWaitlistPayload(phone, candidateId) {
+function buildWaitlistPayload(identity, candidateId, variant) {
   const connection = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
 
   return {
     type: "waitlist_signup",
     product: PRODUCT,
-    phone,
+    // Only the identifier this arm actually asked for. The other column stays
+    // blank on the signup row and is filled in later only if the visitor
+    // volunteers it on the profile page.
+    phone: variant === "email" ? "" : identity,
+    email: variant === "email" ? identity : "",
+    waitlist_variant: variant,
     candidate_id: candidateId,
     source: "grand-website",
     submitted_at: new Date().toISOString(),
@@ -487,63 +497,98 @@ function submitWaitlist(endpoint, payload, options = {}) {
 }
 
 if (waitlistForm) {
-  const input = waitlistForm.querySelector("input[type='tel']");
-  const button = waitlistForm.querySelector("button[type='submit']");
-  let trackedPhoneInputStart = false;
+  // The markup ships one field block per A/B arm. Whichever one this session
+  // was not assigned is already hidden by the stylesheet, so remove it from the
+  // DOM outright: a hidden `required` input would otherwise stay behind as an
+  // autofill and screen-reader target. No reflow, because it already occupies
+  // no space. Defaults to phone when ab-test.js is blocked or absent, matching
+  // the stylesheet's fallback.
+  const activeVariant = window.grandWaitlistVariant === "email" ? "email" : "phone";
+  waitlistForm
+    .querySelectorAll(`[data-waitlist-field]:not([data-waitlist-field="${activeVariant}"])`)
+    .forEach((field) => field.remove());
 
-  function syncWaitlistPhoneState(options = {}) {
+  const input = waitlistForm.querySelector("input[type='tel'], input[type='email']");
+  const button = waitlistForm.querySelector("button[type='submit']");
+  const isEmailVariant = input?.type === "email";
+  let trackedFieldInputStart = false;
+
+  // The test's exposure event, and the funnel's denominator. Fired here rather
+  // than in ab-test.js because grandTrackWebsiteEvent does not exist yet when
+  // that synchronous head script runs. Deliberately PostHog-only: the sheet
+  // pipeline already gets a variant-tagged section_view for #waitlist, and an
+  // extra beacon per homepage view would add an Apps Script execution per
+  // visitor for data we already have.
+  window.grandTrackWebsiteEvent?.("waitlist_variant_assigned", {
+    waitlist_variant: activeVariant,
+  });
+
+  function isValidWaitlistValue() {
+    if (!input) return false;
+
+    return isEmailVariant
+      ? input.value.trim().length > 0 && input.checkValidity()
+      : isValidWaitlistPhone(input);
+  }
+
+  function syncWaitlistFieldState(options = {}) {
     if (!input || !button) return;
 
-    const hasValue = getUsPhoneDigits(input.value).length > 0;
-    const isValid = isValidWaitlistPhone(input);
+    const hasValue = isEmailVariant
+      ? input.value.trim().length > 0
+      : getUsPhoneDigits(input.value).length > 0;
+    const isValid = isValidWaitlistValue();
     const showError = Boolean(options.showError && hasValue && !isValid);
 
     button.disabled = !isValid;
     input.setAttribute("aria-invalid", showError ? "true" : "false");
 
     if (showError) {
-      setWaitlistStatus("Enter a 10-digit US phone number.", "error");
+      setWaitlistStatus(
+        isEmailVariant ? "Enter a valid email address." : "Enter a 10-digit US phone number.",
+        "error",
+      );
     } else if (!options.preserveStatus) {
       setWaitlistStatus("", "neutral");
     }
   }
 
   if (input && button) {
-    syncWaitlistPhoneState();
+    syncWaitlistFieldState();
 
     input.addEventListener(
       "focus",
       () => {
-        trackAnalyticsEvent("waitlist_phone_focus", {
+        trackAnalyticsEvent(`waitlist_${activeVariant}_focus`, {
           section_id: "waitlist",
         });
         window.grandTrackWebsiteEvent?.("waitlist_started", {
-          form_type: "phone",
+          form_type: activeVariant,
         });
       },
       { once: true },
     );
 
     input.addEventListener("input", () => {
-      formatPhoneInput(input);
-      syncWaitlistPhoneState();
+      if (!isEmailVariant) formatPhoneInput(input);
+      syncWaitlistFieldState();
 
-      if (trackedPhoneInputStart || input.value.trim().length === 0) return;
+      if (trackedFieldInputStart || input.value.trim().length === 0) return;
 
-      trackedPhoneInputStart = true;
-      trackAnalyticsEvent("waitlist_phone_input_start", {
+      trackedFieldInputStart = true;
+      trackAnalyticsEvent(`waitlist_${activeVariant}_input_start`, {
         section_id: "waitlist",
-        ...getPhoneFieldState(input),
+        ...getWaitlistFieldState(input, isEmailVariant),
       });
     });
 
     input.addEventListener("blur", () => {
-      formatPhoneInput(input);
-      syncWaitlistPhoneState({ showError: true });
+      if (!isEmailVariant) formatPhoneInput(input);
+      syncWaitlistFieldState({ showError: true });
 
-      trackAnalyticsEvent("waitlist_phone_blur", {
+      trackAnalyticsEvent(`waitlist_${activeVariant}_blur`, {
         section_id: "waitlist",
-        ...getPhoneFieldState(input),
+        ...getWaitlistFieldState(input, isEmailVariant),
       });
     });
   }
@@ -558,17 +603,21 @@ if (waitlistForm) {
       section_id: "waitlist",
     });
 
-    formatPhoneInput(input);
-    const phone = getWaitlistPhoneSubmissionValue(input);
-    if (!isValidWaitlistPhone(input)) {
+    if (!isEmailVariant) formatPhoneInput(input);
+    const identity = isEmailVariant
+      ? input.value.trim()
+      : getWaitlistPhoneSubmissionValue(input);
+
+    if (!isValidWaitlistValue()) {
+      const failureReason = isEmailVariant ? "invalid_email" : "invalid_phone";
       trackAnalyticsEvent("waitlist_submit_error", {
         section_id: "waitlist",
-        error: "invalid_phone",
+        error: failureReason,
       });
       window.grandTrackWebsiteEvent?.("waitlist_submission_failed", {
-        failure_reason: "invalid_phone",
+        failure_reason: failureReason,
       });
-      syncWaitlistPhoneState({ showError: true });
+      syncWaitlistFieldState({ showError: true });
       input.focus();
       return;
     }
@@ -595,7 +644,7 @@ if (waitlistForm) {
     try {
       const candidateId = window.grandGetOrCreateWebsiteCandidateId?.() || "";
       window.grandIdentifyWebsiteCandidate?.(candidateId);
-      const payload = buildWaitlistPayload(phone, candidateId);
+      const payload = buildWaitlistPayload(identity, candidateId, activeVariant);
       void submitWaitlist(endpoint, payload, { waitForCompletion: false });
       waitlistForm.reset();
       submitted = true;
@@ -603,18 +652,28 @@ if (waitlistForm) {
         section_id: "waitlist",
       });
       window.grandTrackWebsiteEvent?.("waitlist_signup", {
-        form_type: "phone",
+        form_type: activeVariant,
       });
       firePixelConversion("Lead", "SignUp");
       setWaitlistStatus("You're on the list. Taking you to a couple of quick questions...", "success");
 
       // Progressive profiling: hand off to the profile page to collect
-      // qualifying details, without ever gating the phone number behind them.
-      // The phone travels via sessionStorage (not the URL) so it isn't leaked
+      // qualifying details, without ever gating the identifier behind them.
+      // The value travels via sessionStorage (not the URL) so it isn't leaked
       // into the profile page's referrer/pixel traffic. The success message
       // above stays visible if navigation is blocked.
       try {
-        window.sessionStorage.setItem("grand_signup_phone", phone);
+        window.sessionStorage.setItem(
+          isEmailVariant ? "grand_signup_email" : "grand_signup_phone",
+          identity,
+        );
+        // Clear the opposite key. welcome.html decides what to ask for from
+        // which of these two exists, so leaving a stale value from an earlier
+        // ?variant= switch in the same session would make it conclude we
+        // already have both and offer neither.
+        window.sessionStorage.removeItem(
+          isEmailVariant ? "grand_signup_phone" : "grand_signup_email",
+        );
       } catch {}
       window.location.assign("welcome.html");
     } catch (error) {
@@ -630,7 +689,7 @@ if (waitlistForm) {
     } finally {
       delete waitlistForm.dataset.submitting;
       button.textContent = originalLabel;
-      if (!submitted) syncWaitlistPhoneState({ preserveStatus: true });
+      if (!submitted) syncWaitlistFieldState({ preserveStatus: true });
     }
   });
 }
@@ -644,23 +703,37 @@ function setProfileStatus(message, type = "neutral") {
 }
 
 function buildProfilePayload(form) {
-  let phone = "";
+  let storedPhone = "";
+  let storedEmail = "";
   let candidateId = "";
   try {
-    phone = window.sessionStorage.getItem("grand_signup_phone") || "";
+    storedPhone = window.sessionStorage.getItem("grand_signup_phone") || "";
+    storedEmail = window.sessionStorage.getItem("grand_signup_email") || "";
     candidateId = window.sessionStorage.getItem("grand_website_candidate_id") || "";
   } catch {}
 
   const data = new FormData(form);
+  const phoneInput = form.querySelector("input[type='tel']");
+  // The optional second contact method, normalized the same way the homepage
+  // does it so the two arms write identically formatted values. Sent only when
+  // non-empty: the backend writes contact columns only for non-empty values, so
+  // a blank field can never clear what the signup already captured.
+  const submittedPhone =
+    phoneInput && getUsPhoneDigits(phoneInput.value).length > 0
+      ? getWaitlistPhoneSubmissionValue(phoneInput)
+      : "";
 
   return {
     type: "waitlist_profile",
     product: PRODUCT,
-    phone,
+    // Whichever identifier the signup captured is the identity used to find
+    // this person's row; the other one, if given here, is extra contact data.
+    phone: storedPhone || submittedPhone,
+    email: storedEmail || String(data.get("email") || "").trim(),
+    // Lets the backend match the signup row on the column that arm actually
+    // wrote, instead of guessing phone-then-email and appending a duplicate.
+    waitlist_variant: window.grandWaitlistVariant || "",
     candidate_id: candidateId,
-    // Optional: phone stays the identity; email is captured only if the visitor
-    // chooses to give it, and lands in the row's existing email column.
-    email: String(data.get("email") || "").trim(),
     source: "grand-website",
     full_name: String(data.get("full_name") || "").trim(),
     zipcode: String(data.get("zipcode") || "").trim(),
@@ -679,6 +752,26 @@ if (profileForm) {
   const doneMessage = document.querySelector("[data-profile-done]");
   const waitlistedMessage = document.querySelector("[data-profile-waitlisted]");
 
+  // Ask only for the contact method the signup did not capture. The unused
+  // field is already hidden by the stylesheet; removing it stops autofill
+  // quietly populating a value the visitor never saw themselves give us.
+  // "both" (a direct visit, or a session with nothing stored) leaves both.
+  const profileAsk = window.grandProfileAsk || "both";
+  if (profileAsk === "email" || profileAsk === "phone") {
+    profileForm
+      .querySelectorAll(`[data-profile-field]:not([data-profile-field="${profileAsk}"])`)
+      .forEach((field) => field.remove());
+  }
+
+  // Same live formatting as the homepage phone field, so an optional phone
+  // given here behaves and normalizes identically.
+  const profilePhoneInput = profileForm.querySelector("input[type='tel']");
+  if (profilePhoneInput) {
+    ["input", "blur"].forEach((eventName) => {
+      profilePhoneInput.addEventListener(eventName, () => formatPhoneInput(profilePhoneInput));
+    });
+  }
+
   profileForm.addEventListener("submit", async (event) => {
     event.preventDefault();
 
@@ -690,13 +783,15 @@ if (profileForm) {
       section_id: "welcome",
     });
 
-    // Every field except "why are you interested" is required: the qualifier
-    // answers decide who is routed to the scheduling call vs. the waitlist, and
-    // name/email/ZIP are how we follow up, so we can't accept a blank submission.
+    // The qualifier answers decide who is routed to the scheduling call vs. the
+    // waitlist, and name/ZIP are how we follow up, so those stay required.
+    // The contact field is not required: the signup already captured one way to
+    // reach this person, and the second one is a nice-to-have we would rather
+    // not push anyone away over. Keeping it optional in both arms also keeps
+    // them symmetric, so the test measures the field type and nothing else.
     const answers = new FormData(profileForm);
     const requiredFields = [
       "full_name",
-      "email",
       "zipcode",
       "phone_type",
       "lives_alone",
@@ -717,16 +812,28 @@ if (profileForm) {
       return;
     }
 
-    // The form is novalidate (JS drives the flow), so check the email format
-    // ourselves rather than relying on the browser's native validation.
+    // The form is novalidate (JS drives the flow), so check the optional
+    // contact fields ourselves — but only once something has been typed into
+    // them. Leaving either blank has to submit cleanly.
     const emailField = profileForm.querySelector("#email");
-    if (emailField && !emailField.checkValidity()) {
+    if (emailField && emailField.value.trim() && !emailField.checkValidity()) {
       trackAnalyticsEvent("waitlist_profile_submit_error", {
         section_id: "welcome",
         error: "invalid_email",
       });
-      setProfileStatus("Please enter a valid email address.", "error");
+      setProfileStatus("Please enter a valid email address, or leave it blank.", "error");
       emailField.focus();
+      return;
+    }
+
+    const phoneField = profileForm.querySelector("input[type='tel']");
+    if (phoneField && phoneField.value.trim() && !isValidWaitlistPhone(phoneField)) {
+      trackAnalyticsEvent("waitlist_profile_submit_error", {
+        section_id: "welcome",
+        error: "invalid_phone",
+      });
+      setProfileStatus("Please enter a 10-digit US phone number, or leave it blank.", "error");
+      phoneField.focus();
       return;
     }
 
