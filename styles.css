@@ -935,6 +935,39 @@ h3 {
   max-width: 650px;
 }
 
+/*
+  Homepage waitlist A/B test: phone field vs email field. ab-test.js sets these
+  two attributes on <html> from a synchronous <head> script, so the unused field
+  is hidden by this stylesheet before the first paint. Hiding it from JS after
+  load would flash both fields for a frame; script.js then removes the hidden
+  block from the DOM entirely.
+
+  Phone is the default in both cases: if ab-test.js is blocked or throws and no
+  attribute is ever set, the page falls back to the form that is live today
+  rather than to no form at all.
+
+  All four rules can be deleted together when the test concludes.
+*/
+html:not([data-waitlist-variant="email"]) [data-waitlist-field="email"] {
+  display: none;
+}
+
+html[data-waitlist-variant="email"] [data-waitlist-field="phone"] {
+  display: none;
+}
+
+/*
+  welcome.html offers only the contact method the signup did not capture.
+  data-profile-ask="both", or a missing attribute, shows both fields.
+*/
+html[data-profile-ask="email"] [data-profile-field="phone"] {
+  display: none;
+}
+
+html[data-profile-ask="phone"] [data-profile-field="email"] {
+  display: none;
+}
+
 .waitlist-form {
   margin: 28px auto 0;
   max-width: 620px;
@@ -1121,6 +1154,7 @@ h3 {
 }
 
 .profile-field input[type="email"],
+.profile-field input[type="tel"],
 .profile-field input[type="text"],
 .profile-field textarea {
   background: var(--surface-card);
@@ -1142,6 +1176,7 @@ h3 {
 }
 
 .profile-field input[type="email"]:focus,
+.profile-field input[type="tel"]:focus,
 .profile-field input[type="text"]:focus,
 .profile-field textarea:focus {
   border-color: var(--status-sage);

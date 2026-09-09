@@ -59,6 +59,7 @@
     </script>
     <!-- End Reddit Pixel Code -->
 
+    <script src="ab-test.js"></script>
     <link rel="stylesheet" href="styles.css">
     <script src="posthog.js" defer></script>
     <script src="script.js" defer></script>
@@ -105,7 +106,7 @@
             <form
               class="profile-form"
               data-profile-form
-              data-waitlist-endpoint="https://script.google.com/macros/s/AKfycbwlWToG306aii_X506SiB1tvDmhL_SYTz4Ma8k3KU0MjS6toQP4E09bAz7M1nW25iYt/exec"
+              data-waitlist-endpoint="https://script.google.com/macros/s/AKfycbznF16TQs1AShix3v0rp6DCZVs7P844Cp0KCfeCoApbPh2FF2sCC6M97vKxu_s2YmuY/exec"
               novalidate
             >
             <div class="profile-field">
@@ -119,9 +120,24 @@
               >
             </div>
 
-            <div class="profile-field">
-              <label for="email">Email <span class="req" aria-hidden="true">*</span></label>
-              <p class="profile-hint">So we can reach you about next steps.</p>
+            <!--
+              The contact method the signup did not already capture: the phone
+              arm of the A/B test is offered an email here, the email arm a
+              phone. ab-test.js sets data-profile-ask on <html> from what is
+              actually in sessionStorage rather than from the variant, so a
+              direct visit or a cleared session offers both instead of guessing
+              wrong and asking for something we already have.
+
+              Both are optional. We already have one way to reach this person,
+              and a second one is a nice-to-have that is not worth losing them
+              over. Email used to be required here; it no longer is, which also
+              keeps the two arms symmetric — otherwise the test would measure
+              "required vs optional second field" alongside "phone vs email"
+              and neither result would mean anything.
+            -->
+            <div class="profile-field" data-profile-field="email">
+              <label for="email">Email</label>
+              <p class="profile-hint">Optional &mdash; another way to reach you about next steps.</p>
               <input
                 id="email"
                 name="email"
@@ -129,6 +145,19 @@
                 autocomplete="email"
                 inputmode="email"
                 placeholder="you@example.com"
+              >
+            </div>
+
+            <div class="profile-field" data-profile-field="phone">
+              <label for="phone">Phone number</label>
+              <p class="profile-hint">Optional &mdash; the quickest way to get you set up. US numbers only.</p>
+              <input
+                id="phone"
+                name="phone"
+                type="tel"
+                autocomplete="tel"
+                inputmode="tel"
+                placeholder="(555) 123-4567"
               >
             </div>
 
