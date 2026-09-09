@@ -68,12 +68,24 @@
       pageType = "legal";
     }
 
-    return {
+    const context = {
       platform: "web",
       analytics_surface: "marketing_website",
       website_experience: isGrace ? "grace" : "grand",
       website_page_type: pageType,
     };
+
+    // Which arm of the Grand homepage waitlist A/B test this session is in, as
+    // assigned by ab-test.js. Added here rather than through a register() call
+    // so one insertion point covers the registered super properties, every
+    // website_* event, and $pageview. Guarded on the two known values because
+    // Grace shares this file and has no ab-test.js — its payloads stay
+    // byte-identical.
+    if (window.grandWaitlistVariant === "phone" || window.grandWaitlistVariant === "email") {
+      context.waitlist_variant = window.grandWaitlistVariant;
+    }
+
+    return context;
   }
 
   function safelyCapture(posthog, eventName, properties) {

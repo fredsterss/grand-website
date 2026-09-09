@@ -95,6 +95,7 @@
     </script>
     <!-- End Reddit Pixel Code -->
 
+    <script src="ab-test.js"></script>
     <link rel="stylesheet" href="styles.css">
     <script src="posthog.js" defer></script>
     <script src="script.js" defer></script>
@@ -373,27 +374,62 @@
         <form
           class="waitlist-form"
           data-waitlist-form
-          data-waitlist-endpoint="https://script.google.com/macros/s/AKfycbwlWToG306aii_X506SiB1tvDmhL_SYTz4Ma8k3KU0MjS6toQP4E09bAz7M1nW25iYt/exec"
+          data-waitlist-endpoint="https://script.google.com/macros/s/AKfycbznF16TQs1AShix3v0rp6DCZVs7P844Cp0KCfeCoApbPh2FF2sCC6M97vKxu_s2YmuY/exec"
           novalidate
         >
-          <label for="phone">Phone number</label>
-          <div class="form-row phone-form-row">
-            <div class="phone-input-shell">
-              <span class="phone-country-code" aria-hidden="true">+1</span>
+          <!--
+            One field block per A/B arm. ab-test.js sets data-waitlist-variant
+            on <html> from a synchronous head script and styles.css hides the
+            unused block before the first paint; script.js then removes it from
+            the DOM outright, so there is no hidden input left for autofill or a
+            screen reader to find. Phone is the default when the attribute is
+            absent, so a blocked or broken script degrades to today's form.
+            Both arms share the one status line below.
+          -->
+          <div data-waitlist-field="phone">
+            <label for="phone">Phone number</label>
+            <div class="form-row phone-form-row">
+              <div class="phone-input-shell">
+                <span class="phone-country-code" aria-hidden="true">+1</span>
+                <input
+                  id="phone"
+                  name="phone"
+                  type="tel"
+                  autocomplete="tel"
+                  inputmode="tel"
+                  placeholder="(555) 123-4567"
+                  aria-describedby="waitlist-status"
+                  required
+                >
+              </div>
+              <button type="submit" disabled>Become a tester</button>
+            </div>
+          </div>
+
+          <div data-waitlist-field="email">
+            <label for="email">Email</label>
+            <div class="form-row">
               <input
-                id="phone"
-                name="phone"
-                type="tel"
-                autocomplete="tel"
-                inputmode="tel"
-                placeholder="(555) 123-4567"
-                aria-describedby="phone-status"
+                id="email"
+                name="email"
+                type="email"
+                autocomplete="email"
+                inputmode="email"
+                placeholder="you@example.com"
+                aria-describedby="waitlist-status"
                 required
               >
+              <!--
+                Ships disabled, like the phone button, and is enabled by the
+                same validity check. Matching this matters: if one arm's button
+                started enabled and the other's did not, the test would be
+                measuring two changes at once.
+              -->
+              <button type="submit" disabled>Become a tester</button>
             </div>
-            <button type="submit" disabled>Become a tester</button>
           </div>
-          <p id="phone-status" class="form-status" data-waitlist-status role="status" aria-live="polite"></p>
+
+          <p id="waitlist-status" class="form-status" data-waitlist-status role="status" aria-live="polite"></p>
         </form>
       </section>
     </main>
