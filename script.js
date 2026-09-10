@@ -503,6 +503,15 @@ if (waitlistForm) {
   // autofill and screen-reader target. No reflow, because it already occupies
   // no space. Defaults to phone when ab-test.js is blocked or absent, matching
   // the stylesheet's fallback.
+  // Whether ab-test.js actually ran and assigned an arm. When it did not — the
+  // script was dropped by a flaky connection, failed to parse on an old engine,
+  // or the visitor is a bot running a stripped JS engine — `activeVariant`
+  // below silently falls back to phone. That fallback is intentional (degrade
+  // to the form that was live before this test), but it is invisible, and an
+  // invisible fallback is indistinguishable from a real assignment when you are
+  // staring at a lopsided split wondering whether the randomizer is broken.
+  const variantWasAssigned =
+    window.grandWaitlistVariant === "phone" || window.grandWaitlistVariant === "email";
   const activeVariant = window.grandWaitlistVariant === "email" ? "email" : "phone";
   waitlistForm
     .querySelectorAll(`[data-waitlist-field]:not([data-waitlist-field="${activeVariant}"])`)
@@ -519,8 +528,17 @@ if (waitlistForm) {
   // pipeline already gets a variant-tagged section_view for #waitlist, and an
   // extra beacon per homepage view would add an Apps Script execution per
   // visitor for data we already have.
+  //
+  // `variant_assigned: false` marks a visitor who was never randomized. These
+  // are already excluded from the experiment itself, because posthog.js only
+  // sets the `$feature/...` property when a real arm was assigned — so they
+  // cannot skew the split. What they do skew is the denominator: they are
+  // traffic the experiment never saw. Tagging them turns "how often does this
+  // happen?" into a number you can read off a breakdown instead of a question
+  // that has to be re-argued every time the split looks uneven.
   window.grandTrackWebsiteEvent?.("waitlist_variant_assigned", {
     waitlist_variant: activeVariant,
+    variant_assigned: variantWasAssigned,
   });
 
   function isValidWaitlistValue() {
