@@ -4,6 +4,7 @@
   const POSTHOG_PROJECT_TOKEN = "phc_pcunHwXxRJ2QgbwTzYuExEm8toDhHboXmfEnzK38A8qd";
   const POSTHOG_API_HOST = "https://us.i.posthog.com";
   const POSTHOG_ASSET_URL = "https://us-assets.i.posthog.com/static/1/array.js";
+  const WAITLIST_EXPERIMENT_FLAG_KEY = "homepage-waitlist-contact-field";
   const CANDIDATE_ID_STORAGE_KEY = "grand_website_candidate_id";
   const queuedEvents = [];
   let posthogReady = false;
@@ -83,6 +84,12 @@
     // byte-identical.
     if (window.grandWaitlistVariant === "phone" || window.grandWaitlistVariant === "email") {
       context.waitlist_variant = window.grandWaitlistVariant;
+      // PostHog's experiment analysis expects externally assigned variants on
+      // a $feature/<flag-key> property. Keep the local, synchronous assignment
+      // as the source of truth so loading analytics can never delay or flash
+      // the waitlist field. PostHog reserves "control" for the first variant.
+      context[`$feature/${WAITLIST_EXPERIMENT_FLAG_KEY}`] =
+        window.grandWaitlistVariant === "phone" ? "control" : "test";
     }
 
     return context;
