@@ -50,6 +50,22 @@ function createSessionId() {
     : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
+// One exposure per session, not per page load — see the call site. Marks the
+// session as counted and reports whether it already was. Storage failures fall
+// back to logging the exposure: an over-count is a worse outcome than a missing
+// one only when it is silent, and a browser with no sessionStorage also has no
+// sticky variant, so each of its page loads genuinely is a fresh assignment.
+function hasLoggedVariantExposure() {
+  const key = "grand_waitlist_exposure_logged";
+
+  try {
+    if (window.sessionStorage.getItem(key)) return true;
+    window.sessionStorage.setItem(key, "1");
+  } catch {}
+
+  return false;
+}
+
 function getViewportPayload() {
   return {
     width: window.innerWidth,
@@ -503,6 +519,15 @@ if (waitlistForm) {
   // autofill and screen-reader target. No reflow, because it already occupies
   // no space. Defaults to phone when ab-test.js is blocked or absent, matching
   // the stylesheet's fallback.
+  // Whether ab-test.js actually ran and assigned an arm. When it did not — the
+  // script was dropped by a flaky connection, failed to parse on an old engine,
+  // or the visitor is a bot running a stripped JS engine — `activeVariant`
+  // below silently falls back to phone. That fallback is intentional (degrade
+  // to the form that was live before this test), but it is invisible, and an
+  // invisible fallback is indistinguishable from a real assignment when you are
+  // staring at a lopsided split wondering whether the randomizer is broken.
+  const variantWasAssigned =
+    window.grandWaitlistVariant === "phone" || window.grandWaitlistVariant === "email";
   const activeVariant = window.grandWaitlistVariant === "email" ? "email" : "phone";
   waitlistForm
     .querySelectorAll(`[data-waitlist-field]:not([data-waitlist-field="${activeVariant}"])`)
@@ -519,9 +544,29 @@ if (waitlistForm) {
   // pipeline already gets a variant-tagged section_view for #waitlist, and an
   // extra beacon per homepage view would add an Apps Script execution per
   // visitor for data we already have.
-  window.grandTrackWebsiteEvent?.("waitlist_variant_assigned", {
-    waitlist_variant: activeVariant,
-  });
+  //
+  // Fired at most ONCE PER SESSION. The variant is sticky for the whole
+  // session, so a visitor who reloads the homepage — or navigates back to it
+  // from welcome.html — would otherwise log an exposure per page load, every
+  // one of them in the same arm. That does not just inflate the count, it
+  // biases the ratio: a handful of reloads by a few visitors is enough to make
+  // an even 50/50 assignment read as lopsided, which is exactly what it did
+  // (15 PostHog exposures against 9 real sessions, splitting 11/4 while the
+  // sheet showed 12/12 for the day).
+  //
+  // `variant_assigned: false` marks a visitor who was never randomized. These
+  // are already excluded from the experiment itself, because posthog.js only
+  // sets the `$feature/...` property when a real arm was assigned — so they
+  // cannot skew the split. What they do skew is the denominator: they are
+  // traffic the experiment never saw. Tagging them turns "how often does this
+  // happen?" into a number you can read off a breakdown instead of a question
+  // that has to be re-argued every time the split looks uneven.
+  if (!hasLoggedVariantExposure()) {
+    window.grandTrackWebsiteEvent?.("waitlist_variant_assigned", {
+      waitlist_variant: activeVariant,
+      variant_assigned: variantWasAssigned,
+    });
+  }
 
   function isValidWaitlistValue() {
     if (!input) return false;
